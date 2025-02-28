@@ -2,7 +2,7 @@ import socket
 import json
 import uuid
 
-from src.errors import RPCException
+from nest_tcp.errors import RPCException
 
 
 class TCPClient:

@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from src.decorators import EVENT_HANDLERS, MESSAGE_HANDLERS
+from nest_tcp.decorators import EVENT_HANDLERS, MESSAGE_HANDLERS
 
 
 class TCPServer:
