@@ -4,12 +4,16 @@ import json
 from src.decorators import EVENT_HANDLERS, MESSAGE_HANDLERS
 
 
-class TcpServer:
+class TCPServer:
     def __init__(self, host: str | None, port: int | None):
         self.host = host or "127.0.0.1"
         self.port = port or 5000
 
-    async def start(self):
+    def start(self):
+        """Start the TCP server"""
+        asyncio.create_task(self.__start_server())
+
+    async def __start_server(self):
         server = await asyncio.start_server(self.__handle_client, self.host, self.port)
         async with server:
             await server.serve_forever()
