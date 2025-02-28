@@ -20,7 +20,15 @@ class TCPClient:
 
     def __communicate(self, pattern, data, expect_response: bool):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.connect((self.host, self.port))
+            try:
+                sock.connect((self.host, self.port))
+            except Exception as e:
+                raise RPCException({
+                    "message": "Connection Timeout",
+                    "data": {"message": str(e)},
+                    "code": 408,
+                })
+
             json_data = self.__pack_outgoing_message_to_nest(pattern, data)
             sock.sendall(json_data)
 
