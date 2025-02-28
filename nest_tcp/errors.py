@@ -11,3 +11,6 @@ class RPCException(Exception):
         elif self.data and self.data.get('message'):
             message = self.data.get('message')
         return f'RPCException: code={self.code}, message={message}'
+
+    def to_dict(self):
+        return {'code': self.code, 'message': self.message, 'data': self.data}

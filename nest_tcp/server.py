@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from nest_tcp.decorators import EVENT_HANDLERS, MESSAGE_HANDLERS
+from nest_tcp.errors import RPCException
 
 
 class TCPServer:
@@ -38,25 +39,38 @@ class TCPServer:
 
             pattern = json.dumps(message["pattern"])
             response_data = None
+            error_data = None
 
             if pattern in MESSAGE_HANDLERS:
                 response_data = await MESSAGE_HANDLERS[pattern](message["data"])
             elif pattern in EVENT_HANDLERS:
                 await EVENT_HANDLERS[pattern](message["data"])
-                response_data = None  # No response needed for events
             else:
-                response_data = {"error": "Pattern not found"}
+                error_data = {"message": "Pattern not found"}
 
-            # Send response only for RPC messages
-            response = json.dumps(
-                {"id": message["id"], "response": response_data}).encode()
-            response = f"{len(response)}#{response.decode()}".encode()
-            writer.write(response)
-            await writer.drain()
+            await self.__write_response(writer, message["id"], error_data, response_data)
 
+        except RPCException as e:
+            await self.__write_response(writer, message["id"], e.to_dict(), None)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"TCP Error: {e}")
+            error_data = {"message": str(e)}
+            await self.__write_response(writer, message["id"], error_data, None)
 
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def __write_response(
+        self,
+        writer: asyncio.StreamWriter,
+        id: str,
+        error: dict | None,
+        response: dict | None
+    ):
+        """Write response to the socket"""
+        response = json.dumps(
+            {"id": id, "error": error, "response": response}).encode()
+        response = f"{len(response)}#{response.decode()}".encode()
+        writer.write(response)
+        await writer.drain()
