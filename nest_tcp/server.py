@@ -21,6 +21,7 @@ class TCPServer:
 
     async def __handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handles incoming TCP requests"""
+        response: bytes
         try:
             # Read data from socket
             data = await reader.read(1024)
@@ -48,29 +49,32 @@ class TCPServer:
             else:
                 error_data = {"message": "Pattern not found"}
 
-            await self.__write_response(writer, message["id"], error_data, response_data)
+            response = self.__build_response(message["id"], error_data, response_data)
 
         except RPCException as e:
-            await self.__write_response(writer, message["id"], e.to_dict(), None)
+            response = self.__build_response(message["id"], e.to_dict(), None)
         except Exception as e:
             print(f"TCP Error: {e}")
             error_data = {"message": str(e)}
-            await self.__write_response(writer, message["id"], error_data, None)
+            response = self.__build_response(message["id"], error_data, None)
 
         finally:
+            writer.write(response)
+            await writer.drain()
             writer.close()
             await writer.wait_closed()
 
-    async def __write_response(
+    def __build_response(
         self,
-        writer: asyncio.StreamWriter,
-        id: str,
-        error: dict | None,
-        response: dict | None
+        message_id: str,
+        error_data: dict | None,
+        response_data: dict | None
     ):
         """Write response to the socket"""
-        response = json.dumps(
-            {"id": id, "error": error, "response": response}).encode()
+        response = json.dumps({
+            "id": message_id,
+            "err": error_data,
+            "response": response_data,
+        }).encode()
         response = f"{len(response)}#{response.decode()}".encode()
-        writer.write(response)
-        await writer.drain()
+        return response
