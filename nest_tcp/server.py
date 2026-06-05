@@ -4,6 +4,7 @@ import json
 
 from nest_tcp.decorators import EVENT_HANDLERS, MESSAGE_HANDLERS, normalize_pattern
 from nest_tcp.errors import RPCException
+from nest_tcp.framing import encode_frame, utf16_byte_boundary
 
 
 MAX_MESSAGE_LENGTH = 10 * 1024 * 1024  # 10 MiB cap on a declared frame length
@@ -112,21 +113,28 @@ class TCPServer:
 
         prefix = prefix[:-1]  # strip trailing '#'
         try:
-            msg_length = int(prefix.decode())
+            msg_units = int(prefix.decode())
         except (ValueError, UnicodeDecodeError) as e:
             raise ValueError(f"invalid length prefix: {prefix!r}") from e
 
-        if msg_length < 0 or msg_length > MAX_MESSAGE_LENGTH:
-            raise ValueError(f"declared message length out of range: {msg_length}")
+        if msg_units < 0 or msg_units > MAX_MESSAGE_LENGTH:
+            raise ValueError(f"declared message length out of range: {msg_units}")
 
-        # readexactly guarantees the full payload (or raises on short EOF),
-        # unlike read(n) which may return fewer bytes.
-        try:
-            msg_data = await reader.readexactly(msg_length)
-        except asyncio.IncompleteReadError as e:
-            raise ValueError("connection closed before full payload received") from e
+        # NestJS frames length in UTF-16 code units but writes UTF-8 bytes, so
+        # we read UTF-8 bytes until the decoded payload reaches msg_units code
+        # units (for ASCII this is just msg_units bytes).
+        buf = b""
+        boundary = utf16_byte_boundary(buf, msg_units)
+        while boundary is None:
+            chunk = await reader.read(4096)
+            if not chunk:
+                raise ValueError("connection closed before full payload received")
+            buf += chunk
+            boundary = utf16_byte_boundary(buf, msg_units)
 
-        return json.loads(msg_data.decode())
+        # buf[boundary:] (if any) belongs to a subsequent frame. This server
+        # handles one request per connection, so any trailing bytes are ignored.
+        return json.loads(buf[:boundary].decode("utf-8"))
 
     async def __call_handler(self, handler, data):
         """Invoke a handler, supporting both sync and async functions."""
@@ -141,11 +149,10 @@ class TCPServer:
         error_data: dict | None,
         response_data: dict | None
     ):
-        """Write response to the socket"""
-        response = json.dumps({
+        """Build a NestJS-framed response (UTF-16-unit length + UTF-8 body)."""
+        payload = json.dumps({
             "id": message_id,
             "err": error_data,
             "response": response_data,
-        }).encode()
-        response = f"{len(response)}#{response.decode()}".encode()
-        return response
+        })
+        return encode_frame(payload)

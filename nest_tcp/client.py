@@ -3,6 +3,7 @@ import json
 import uuid
 
 from nest_tcp.errors import RPCException
+from nest_tcp.framing import encode_frame, utf16_byte_boundary
 
 
 DEFAULT_TIMEOUT = 30  # seconds for connect and each socket read
@@ -67,18 +68,18 @@ class TCPClient:
     def __pack_outgoing_message_to_nest(self, pattern, data):
         _id = uuid.uuid4()
         dict_merged = {'pattern': pattern, 'data': data, 'id': str(_id)}
-        s_json = json.dumps(dict_merged)
-        # Frame length is the byte count of the (ASCII, since json.dumps defaults
-        # to ensure_ascii) payload, matching the server's byte-based framing.
-        body = s_json.encode()
-        return f'{len(body)}#'.encode() + body
+        # NestJS-compatible framing: UTF-16-unit length prefix + UTF-8 body.
+        # json.dumps defaults to ensure_ascii=True, so the body is ASCII and the
+        # prefix equals the byte count; non-ASCII still frames correctly.
+        return encode_frame(json.dumps(dict_merged))
 
     def __receive_response(self, sock: socket) -> bytes:
-        """Read one ``length#payload`` frame and return the raw payload bytes.
+        """Read one ``length#payload`` frame and return the raw UTF-8 payload.
 
         Reads the prefix up to '#' (tolerant of it spanning multiple packets),
-        then reads exactly ``length`` payload bytes. Raises RPCException if the
-        peer closes before a complete frame arrives.
+        then reads UTF-8 bytes until the decoded payload reaches the declared
+        number of UTF-16 code units (NestJS's length semantics). Raises
+        RPCException if the peer closes before a complete frame arrives.
         """
         buf = b''
         # Accumulate until the '#' delimiter so we can read the length prefix,
@@ -99,24 +100,33 @@ class TCPClient:
 
         prefix, _, body = buf.partition(b'#')
         try:
-            length = int(prefix)
+            units = int(prefix)
         except ValueError:
             raise RPCException({
                 "message": f"Malformed response: invalid length prefix {prefix!r}",
                 "code": 502,
             })
 
-        # Keep reading until we have the full payload.
-        while len(body) < length:
-            chunk = sock.recv(1024)
-            if not chunk:
-                raise RPCException({
-                    "message": "Connection closed mid-response",
-                    "code": 502,
-                })
-            body += chunk
+        # Keep reading until the body holds `units` UTF-16 code units' worth of
+        # UTF-8 bytes.
+        try:
+            boundary = utf16_byte_boundary(body, units)
+            while boundary is None:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    raise RPCException({
+                        "message": "Connection closed mid-response",
+                        "code": 502,
+                    })
+                body += chunk
+                boundary = utf16_byte_boundary(body, units)
+        except ValueError as e:
+            raise RPCException({
+                "message": f"Malformed response: {e}",
+                "code": 502,
+            })
 
-        return body[:length]
+        return body[:boundary]
 
     def __unpack_incoming_response_from_nest(self, payload: bytes):
         message: dict = json.loads(payload.decode())
