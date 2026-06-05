@@ -1,7 +1,8 @@
 import asyncio
+import inspect
 import json
 
-from nest_tcp.decorators import EVENT_HANDLERS, MESSAGE_HANDLERS
+from nest_tcp.decorators import EVENT_HANDLERS, MESSAGE_HANDLERS, normalize_pattern
 from nest_tcp.errors import RPCException
 
 
@@ -50,14 +51,17 @@ class TCPServer:
                 return
             message_id = message.get("id")
 
-            pattern = json.dumps(message["pattern"])
+            pattern = normalize_pattern(message["pattern"])
             response_data = None
             error_data = None
 
             if pattern in MESSAGE_HANDLERS:
-                response_data = await MESSAGE_HANDLERS[pattern](message["data"])
+                response_data = await self.__call_handler(
+                    MESSAGE_HANDLERS[pattern], message.get("data"))
             elif pattern in EVENT_HANDLERS:
-                await EVENT_HANDLERS[pattern](message["data"])
+                # Events are fire-and-forget: run the handler but send no reply.
+                await self.__call_handler(EVENT_HANDLERS[pattern], message.get("data"))
+                return
             else:
                 error_data = {"message": "Pattern not found"}
 
@@ -123,6 +127,13 @@ class TCPServer:
             raise ValueError("connection closed before full payload received") from e
 
         return json.loads(msg_data.decode())
+
+    async def __call_handler(self, handler, data):
+        """Invoke a handler, supporting both sync and async functions."""
+        result = handler(data)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     def __build_response(
         self,

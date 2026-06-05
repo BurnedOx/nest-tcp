@@ -45,7 +45,7 @@ class TCPClient:
                 sock.sendall(json_data)
                 if not expect_response:
                     return
-                message = self.__receive_all_messages(sock)
+                payload = self.__receive_response(sock)
             except socket.timeout as e:
                 raise RPCException({
                     "message": "Request Timeout",
@@ -59,7 +59,7 @@ class TCPClient:
                     "code": 503,
                 })
 
-            error, response = self.__unpack_incoming_response_from_nest(message)
+            error, response = self.__unpack_incoming_response_from_nest(payload)
             if error:
                 raise RPCException(error)
             return response
@@ -68,38 +68,56 @@ class TCPClient:
         _id = uuid.uuid4()
         dict_merged = {'pattern': pattern, 'data': data, 'id': str(_id)}
         s_json = json.dumps(dict_merged)
-        return f'{len(s_json)}#{s_json}'.encode()
+        # Frame length is the byte count of the (ASCII, since json.dumps defaults
+        # to ensure_ascii) payload, matching the server's byte-based framing.
+        body = s_json.encode()
+        return f'{len(body)}#'.encode() + body
 
-    def __receive_all_messages(self, sock: socket):
-        message = b''
-        final_length = 0
-        while True:
-            _d = sock.recv(1024)
-            if _d:
-                message, final_length, done = self.__get_response_message(
-                    message, _d, final_length)
-                if done:
-                    break
-            else:
-                break
-        return message
+    def __receive_response(self, sock: socket) -> bytes:
+        """Read one ``length#payload`` frame and return the raw payload bytes.
 
-    def __get_response_message(self, message, data, final_length):
-        if message == b'':
-            _s = data.split(b'#')
-            final_length = int(_s[0].decode())
+        Reads the prefix up to '#' (tolerant of it spanning multiple packets),
+        then reads exactly ``length`` payload bytes. Raises RPCException if the
+        peer closes before a complete frame arrives.
+        """
+        buf = b''
+        # Accumulate until the '#' delimiter so we can read the length prefix,
+        # even if the prefix itself is split across recv() boundaries.
+        while b'#' not in buf:
+            chunk = sock.recv(1024)
+            if not chunk:
+                raise RPCException({
+                    "message": "Connection closed before response",
+                    "code": 502,
+                })
+            buf += chunk
+            if len(buf) > 64 and b'#' not in buf:
+                raise RPCException({
+                    "message": "Malformed response: length prefix too long",
+                    "code": 502,
+                })
 
-        message += data
+        prefix, _, body = buf.partition(b'#')
         try:
-            if len(message.decode()) == final_length + len(str(final_length)) + 1:
-                return message, final_length, True
-        except UnicodeDecodeError:
-            pass
-        return message, final_length, False
+            length = int(prefix)
+        except ValueError:
+            raise RPCException({
+                "message": f"Malformed response: invalid length prefix {prefix!r}",
+                "code": 502,
+            })
 
-    def __unpack_incoming_response_from_nest(self, message: str):
-        _s = message.split(b'#')
-        final_length = int(_s[0])
-        message: dict = json.loads(
-            message[len(str(final_length)) + 1:].decode())
+        # Keep reading until we have the full payload.
+        while len(body) < length:
+            chunk = sock.recv(1024)
+            if not chunk:
+                raise RPCException({
+                    "message": "Connection closed mid-response",
+                    "code": 502,
+                })
+            body += chunk
+
+        return body[:length]
+
+    def __unpack_incoming_response_from_nest(self, payload: bytes):
+        message: dict = json.loads(payload.decode())
         return message.get('err'), message.get('response')
