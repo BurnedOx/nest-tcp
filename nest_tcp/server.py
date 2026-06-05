@@ -6,16 +6,29 @@ from nest_tcp.errors import RPCException
 
 
 MAX_MESSAGE_LENGTH = 10 * 1024 * 1024  # 10 MiB cap on a declared frame length
+CLIENT_READ_TIMEOUT = 30  # seconds a client may take to send a complete frame
 
 
 class TCPServer:
     def __init__(self, host: str | None, port: int | None):
         self.host = host or "127.0.0.1"
         self.port = port or 5000
+        self._task: asyncio.Task | None = None
 
-    def start(self):
-        """Start the TCP server"""
-        asyncio.create_task(self.__start_server())
+    def start(self) -> asyncio.Task:
+        """Start the TCP server as a background task on the running event loop.
+
+        The task is retained on ``self._task`` so it is not garbage-collected
+        mid-run (a bare ``create_task`` may be), and is returned for callers who
+        want to ``await`` or cancel it. Must be called from within a running
+        event loop; prefer :meth:`serve` to run the server directly.
+        """
+        self._task = asyncio.create_task(self.__start_server())
+        return self._task
+
+    async def serve(self):
+        """Run the server until cancelled (use this when you can await)."""
+        await self.__start_server()
 
     async def __start_server(self):
         server = await asyncio.start_server(self.__handle_client, self.host, self.port)
@@ -27,7 +40,11 @@ class TCPServer:
         response: bytes | None = None
         message_id = None
         try:
-            message = await self.__read_message(reader)
+            # Bound how long a slow/idle peer can hold this connection open
+            # (slowloris protection); a stalled read raises TimeoutError.
+            message = await asyncio.wait_for(
+                self.__read_message(reader), timeout=CLIENT_READ_TIMEOUT
+            )
             if message is None:
                 # Peer closed before sending a (complete) frame; nothing to reply.
                 return
