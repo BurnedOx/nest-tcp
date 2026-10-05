@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="nest_tcp",
-    version="1.0.0",
+    version="1.1.0",
     packages=find_packages(),
     install_requires=[],
     author="Mainak Debnath",
@@ -14,5 +14,5 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.7',
+    python_requires='>=3.10',
 )

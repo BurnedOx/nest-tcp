@@ -37,11 +37,23 @@ client.emit({"event": "user_viewed"}, {"id": 42})
 ```
 
 - `send(pattern, data)` — sends an RPC message and blocks for the response.
-  Raises `RPCException` on a transport error (connect/timeout) or when the remote
-  handler returns an error.
+  Raises `RPCException` on a transport error (connect/timeout), a malformed
+  response, or when the remote handler returns an error.
 - `emit(pattern, data)` — sends an event and returns without waiting.
-- `timeout` bounds both connection and each read; on expiry `send` raises
-  `RPCException` with code `408`. A refused/failed connection raises code `503`.
+- `timeout` bounds connecting, and then the whole request/response exchange; on
+  expiry `send` raises `RPCException` with code `408`. A refused/failed
+  connection raises code `503`, and a malformed or truncated response `502`.
+- `max_response_length` caps the size of a response (default 10 MiB; `None`
+  disables the cap). A larger response raises `RPCException` with code `502`.
+- `data` must be valid JSON: `NaN`/`Infinity` raise `ValueError`, because a
+  NestJS peer cannot parse them.
+
+The client is blocking. From `async` code (e.g. a FastAPI route), run it in a
+worker thread so it doesn't stall the event loop:
+
+```python
+user = await asyncio.to_thread(client.send, {"cmd": "get_user"}, {"id": 42})
+```
 
 ## Server
 
@@ -78,9 +90,18 @@ Notes:
 - Patterns may be strings or dicts. Dict patterns are matched regardless of key
   order (`{"cmd": "x", "v": 1}` == `{"v": 1, "cmd": "x"}`).
 - Handlers may be `async def` or plain `def`; both receive the message `data`.
+  The decorators only register the function and return it unchanged.
 - Raise `RPCException` from a handler to return a structured error to the caller.
+  Any other exception is logged with its traceback and the caller receives a
+  generic `{"message": "Internal server error"}`, so internal details don't leak.
 - Events (`@event_pattern`) are fire-and-forget — the server runs the handler and
   sends no reply.
+- A connection may carry any number of messages, handled concurrently and
+  answered by `id`, which is how a NestJS `ClientTCP` uses its socket.
+- Errors are reported through the `nest_tcp` logger (standard `logging`).
+- `TCPServer(host, port, max_connections=N)` limits concurrent connections
+  (unlimited by default). Pass port `0` to bind an ephemeral port; `server.port`
+  holds the real one once the server is listening.
 
 ### Starting in an already-running loop
 
@@ -95,6 +116,10 @@ async def startup():
     app.state.tcp.start()     # returns the asyncio.Task
 ```
 
+If the server cannot start (for example the port is already in use), the error
+is logged; await the returned task if you want it raised instead. Cancelling the
+task stops the listener and closes open connections.
+
 ## Errors
 
 `RPCException(error_dict)` carries `code`, `message`, and `data` and is used both
@@ -105,6 +130,10 @@ the client.
 raise RPCException({"code": 400, "message": "Bad request", "data": {"field": "id"}})
 ```
 
+NestJS reports some errors as a bare string (for example when no handler matches
+the pattern). Those arrive as an `RPCException` whose `message` is that string
+and whose `code` and `data` are `None`.
+
 ## Protocol & interoperability
 
 Frames follow NestJS's `JsonSocket`: a decimal length, a `#` delimiter, then the
@@ -113,8 +142,26 @@ JSON payload. The length counts **UTF-16 code units** (matching JavaScript's
 (accents, emoji, etc.) is framed correctly in both directions. For pure-ASCII
 payloads this is identical to a plain byte-length framing.
 
-The transport bounds slow/idle peers with read timeouts and caps the declared
-message length to guard against malformed or hostile input.
+Requests carry an `id` and are answered with `{id, err, response, isDisposed}`;
+events carry no `id` and get no reply. A dict pattern that arrives as its JSON
+string (which is how NestJS's `emit()` sends it) matches the same handler as the
+dict itself.
+
+The server bounds slow peers with read, write and idle timeouts, caps message
+size at 10 MiB, and limits how many messages one connection may have in flight
+(the constants at the top of `nest_tcp/server.py`).
+
+## Security
+
+The NestJS TCP transport has no authentication or encryption: anyone who can
+reach the port can call every registered handler. Bind to `127.0.0.1` (the
+default) or a private interface, and keep the port off the public internet.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## License
 

@@ -21,6 +21,7 @@ Reference: nestjs/nest packages/microservices/helpers/json-socket.ts
 """
 
 DELIMITER = b"#"
+MAX_PREFIX_DIGITS = 20  # longest length prefix accepted before the delimiter
 
 
 def utf16_length(s: str) -> int:
@@ -35,46 +36,127 @@ def encode_frame(payload: str) -> bytes:
     return f"{utf16_length(payload)}{DELIMITER.decode()}".encode("ascii") + body
 
 
-def utf16_byte_boundary(buf: bytes, target_units: int):
-    """Find where ``target_units`` UTF-16 code units end inside a UTF-8 buffer.
+def _char_size(lead: int) -> int:
+    """Byte length of the UTF-8 sequence that starts with ``lead``."""
+    if lead < 0x80:
+        return 1
+    if 0xC0 <= lead < 0xE0:
+        return 2
+    if 0xE0 <= lead < 0xF0:
+        return 3
+    if 0xF0 <= lead < 0xF8:
+        return 4
+    # 0x80-0xBF is a stray continuation byte; 0xF8+ never appears in UTF-8.
+    raise ValueError("invalid UTF-8 in frame")
 
-    Returns the byte length of the prefix of ``buf`` that decodes to exactly
-    ``target_units`` UTF-16 code units, or ``None`` if ``buf`` does not yet
-    contain that many complete units (caller should read more bytes).
 
-    Walks UTF-8 lead bytes rather than fully decoding, so it is cheap and
-    correctly handles a multi-byte sequence split across the buffer's tail.
+class FrameDecoder:
+    """Incremental decoder for a stream of ``<length>#<json>`` frames.
+
+    Feed it bytes as they arrive and pull complete payloads out with
+    :meth:`next_frame`. Each byte is examined once however the stream is
+    chunked, and bytes past the end of a frame are kept for the next one, so
+    several frames may share a connection.
+
+    ``max_length`` caps both a frame's declared length and its size in bytes.
     """
-    if target_units <= 0:
-        return 0
-    units = 0
-    i = 0
-    n = len(buf)
-    while i < n:
-        b = buf[i]
-        if b < 0x80:        # 1-byte ASCII -> 1 UTF-16 unit
-            step, u = 1, 1
-        elif b < 0xC0:      # 0x80-0xBF: stray continuation byte -> invalid
-            raise ValueError("invalid UTF-8 lead byte in frame")
-        elif b < 0xE0:      # 2-byte sequence -> 1 unit
-            step, u = 2, 1
-        elif b < 0xF0:      # 3-byte sequence -> 1 unit
-            step, u = 3, 1
-        elif b < 0xF8:      # 4-byte sequence -> 2 units (surrogate pair)
-            step, u = 4, 2
-        else:
-            raise ValueError("invalid UTF-8 lead byte in frame")
 
-        if i + step > n:
-            # Incomplete trailing multi-byte sequence; need more bytes.
+    def __init__(self, max_length: int | None = None):
+        self._max_length = max_length
+        self._buf = bytearray()
+        self._target: int | None = None  # declared UTF-16 units of the frame being read
+        self._pos = 0    # body bytes of that frame scanned so far
+        self._units = 0  # UTF-16 units those bytes decode to
+
+    @property
+    def mid_frame(self) -> bool:
+        """True while part of a frame has arrived but not all of it."""
+        return self._target is not None or bool(self._buf)
+
+    def feed(self, data: bytes) -> None:
+        self._buf += data
+
+    def next_frame(self) -> str | None:
+        """Return the next complete payload, or ``None`` if more bytes are needed.
+
+        Raises ``ValueError`` on a malformed or oversized frame; the stream is
+        then no longer frame-aligned and the decoder should be discarded.
+        """
+        if self._target is None and not self._read_prefix():
             return None
-        if units + u > target_units:
-            # The boundary would fall inside an astral char's surrogate pair.
-            # A well-formed sender never frames mid-code-point, so treat this
-            # as a corrupt length rather than splitting the character.
-            raise ValueError("frame length splits a surrogate pair")
-        units += u
-        i += step
-        if units == target_units:
-            return i
-    return None  # ran out of bytes before reaching target_units
+        if not self._scan_body():
+            return None
+        payload = self._buf[:self._pos].decode("utf-8")
+        del self._buf[:self._pos]
+        self._target = None
+        self._pos = self._units = 0
+        return payload
+
+    def _read_prefix(self) -> bool:
+        """Consume ``<length>#`` from the buffer; False if it isn't all there yet."""
+        buf = self._buf
+        end = buf.find(DELIMITER, 0, MAX_PREFIX_DIGITS + 1)
+        if end < 0:
+            head = bytes(buf[:MAX_PREFIX_DIGITS + 1])
+            if head and not head.isdigit():
+                raise ValueError(f"invalid length prefix: {head!r}")
+            if len(head) > MAX_PREFIX_DIGITS:
+                raise ValueError("length prefix too long")
+            return False
+
+        prefix = bytes(buf[:end])
+        if not prefix.isdigit():
+            raise ValueError(f"invalid length prefix: {prefix!r}")
+        length = int(prefix)
+        if self._max_length is not None and length > self._max_length:
+            raise ValueError(f"declared message length out of range: {length}")
+        del buf[:end + 1]
+        self._target = length
+        return True
+
+    def _scan_body(self) -> bool:
+        """Advance over buffered body bytes; True once the whole body is in."""
+        buf = self._buf
+        while self._units < self._target:
+            need = self._target - self._units
+            start = self._pos
+            # ``need`` code units occupy at least ``need`` bytes, so this slice
+            # cannot run past the end of the frame.
+            end = min(start + need, len(buf))
+            if end == start:
+                return False
+
+            # The slice may cut a multi-byte character in half. Back up to the
+            # lead byte of its last character and leave that character for the
+            # next round if it is incomplete.
+            last = end - 1
+            while last > start and end - last < 4 and (buf[last] & 0xC0) == 0x80:
+                last -= 1
+            size = _char_size(buf[last])
+            if last + size > end:
+                end = last
+                if end == start:
+                    # Nothing but that one character is left in the slice:
+                    # take it whole once all of its bytes have arrived.
+                    end = start + size
+                    if end > len(buf):
+                        return False
+
+            chunk = buf[start:end]
+            if chunk.isascii():
+                units = len(chunk)
+            else:
+                try:
+                    units = utf16_length(chunk.decode("utf-8"))
+                except UnicodeDecodeError as e:
+                    raise ValueError("invalid UTF-8 in frame") from e
+            if units > need:
+                # The boundary would fall inside an astral char's surrogate
+                # pair. A well-formed sender never frames mid-code-point, so
+                # treat this as a corrupt length rather than splitting it.
+                raise ValueError("frame length splits a surrogate pair")
+            self._pos = end
+            self._units += units
+            if self._max_length is not None and self._pos > self._max_length:
+                raise ValueError("message too large")
+        return True
